@@ -357,6 +357,50 @@ app.post('/api/rooms/:code/emoji', (req, res) => {
     res.json({ success: true });
 });
 
+// In-game chat
+app.post('/api/rooms/:code/chat', (req, res) => {
+    const room = rooms.get(req.params.code.toUpperCase());
+    if (!room) return res.status(404).json({ error: 'Not found' });
+    
+    const { wallet, message } = req.body;
+    if (!message || message.trim().length === 0) return res.status(400).json({ error: 'Empty message' });
+    if (message.length > 200) return res.status(400).json({ error: 'Message too long' });
+    
+    // Initialize chat array if not exists
+    if (!room.chat) room.chat = [];
+    
+    // Determine if player or spectator
+    const player = room.players.find(p => p.wallet === wallet);
+    const isPlayer = !!player;
+    
+    const chatMsg = {
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 4),
+        wallet,
+        name: getUsername(wallet),
+        message: message.trim(),
+        isPlayer,
+        color: player?.color || null,
+        time: Date.now()
+    };
+    
+    room.chat.push(chatMsg);
+    // Keep last 100 messages
+    if (room.chat.length > 100) room.chat = room.chat.slice(-100);
+    
+    res.json({ success: true, message: chatMsg });
+});
+
+// Get chat messages
+app.get('/api/rooms/:code/chat', (req, res) => {
+    const room = rooms.get(req.params.code.toUpperCase());
+    if (!room) return res.status(404).json({ error: 'Not found' });
+    
+    const since = parseInt(req.query.since) || 0;
+    const messages = (room.chat || []).filter(m => m.time > since);
+    
+    res.json({ success: true, messages });
+});
+
 // List all active rooms
 app.get('/api/rooms', (req, res) => {
     const activeRooms = [];
@@ -404,14 +448,21 @@ app.get('/api/rooms/:code/state', (req, res) => {
     
     updateTimer(room);
     
+    // Update player names from usernames map
+    room.players.forEach(p => {
+        p.name = getUsername(p.wallet);
+    });
+    
     res.json({
         success: true, status: room.status, board: room.board, currentTurn: room.currentTurn,
         lastMove: room.lastMove, winner: room.winner,
         whiteTimeMs: room.whiteTimeMs, blackTimeMs: room.blackTimeMs,
         tokenAmount: room.tokenAmount,
-        players: room.players.map(p => ({ id: p.id, name: p.name, color: p.color, paymentConfirmed: p.paid })),
+        entryFeeUsd: room.entryFeeUsd,
+        players: room.players.map(p => ({ id: p.id, wallet: p.wallet, name: p.name, color: p.color, paymentConfirmed: p.paid })),
         spectatorCount: room.spectators.length,
-        emojis: room.emojis.slice(-10)
+        emojis: room.emojis.slice(-10),
+        chatCount: (room.chat || []).length
     });
 });
 
