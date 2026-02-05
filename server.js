@@ -43,6 +43,8 @@ if (WALLET_PRIVATE_KEY) {
 const rooms = new Map();
 const processedTx = new Set();
 const usernames = new Map();
+const profiles = new Map(); // wallet -> profile data
+const matchHistory = []; // All completed matches
 let cachedTokenPrice = null;
 let priceLastFetch = 0;
 
@@ -114,6 +116,119 @@ app.post('/api/username', (req, res) => {
 app.get('/api/username/:wallet', (req, res) => {
     const username = usernames.get(req.params.wallet);
     res.json({ success: true, username: username || null });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PROFILE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════
+function getOrCreateProfile(wallet) {
+    if (!profiles.has(wallet)) {
+        profiles.set(wallet, {
+            wallet,
+            username: usernames.get(wallet) || wallet.slice(0, 8) + '...',
+            wins: 0,
+            losses: 0,
+            totalEarnings: 0,
+            totalLost: 0,
+            matches: [],
+            joinedAt: Date.now()
+        });
+    }
+    return profiles.get(wallet);
+}
+
+function recordMatch(room, winnerWallet, loserWallet) {
+    const match = {
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        roomCode: room.code,
+        winner: { wallet: winnerWallet, name: getUsername(winnerWallet) },
+        loser: { wallet: loserWallet, name: getUsername(loserWallet) },
+        entryFee: room.entryFeeUsd,
+        tokenAmount: room.tokenAmount,
+        prize: Math.floor(room.tokenAmount * 2 * (1 - COMMISSION_RATE)),
+        timestamp: Date.now()
+    };
+    
+    // Update winner profile
+    const winnerProfile = getOrCreateProfile(winnerWallet);
+    winnerProfile.wins++;
+    winnerProfile.totalEarnings += match.prize;
+    winnerProfile.username = getUsername(winnerWallet);
+    winnerProfile.matches.unshift(match.id);
+    if (winnerProfile.matches.length > 50) winnerProfile.matches.pop();
+    
+    // Update loser profile
+    const loserProfile = getOrCreateProfile(loserWallet);
+    loserProfile.losses++;
+    loserProfile.totalLost += room.tokenAmount;
+    loserProfile.username = getUsername(loserWallet);
+    loserProfile.matches.unshift(match.id);
+    if (loserProfile.matches.length > 50) loserProfile.matches.pop();
+    
+    // Add to global history
+    matchHistory.unshift(match);
+    if (matchHistory.length > 200) matchHistory.pop();
+    
+    console.log(`Match recorded: ${match.winner.name} beat ${match.loser.name}`);
+    return match;
+}
+
+// Get profile by wallet
+app.get('/api/profile/:wallet', (req, res) => {
+    const wallet = req.params.wallet;
+    const profile = getOrCreateProfile(wallet);
+    profile.username = getUsername(wallet); // Update username
+    
+    // Get recent matches with full details
+    const recentMatches = profile.matches
+        .slice(0, 20)
+        .map(matchId => matchHistory.find(m => m.id === matchId))
+        .filter(m => m);
+    
+    // Get unique opponents
+    const opponents = new Map();
+    recentMatches.forEach(m => {
+        const oppWallet = m.winner.wallet === wallet ? m.loser.wallet : m.winner.wallet;
+        const oppName = m.winner.wallet === wallet ? m.loser.name : m.winner.name;
+        const won = m.winner.wallet === wallet;
+        
+        if (!opponents.has(oppWallet)) {
+            opponents.set(oppWallet, { wallet: oppWallet, name: oppName, wins: 0, losses: 0 });
+        }
+        if (won) opponents.get(oppWallet).wins++;
+        else opponents.get(oppWallet).losses++;
+    });
+    
+    res.json({
+        success: true,
+        profile: {
+            ...profile,
+            winRate: profile.wins + profile.losses > 0 
+                ? ((profile.wins / (profile.wins + profile.losses)) * 100).toFixed(1) 
+                : 0,
+            recentMatches,
+            opponents: Array.from(opponents.values()).sort((a, b) => (b.wins + b.losses) - (a.wins + a.losses)).slice(0, 10)
+        }
+    });
+});
+
+// Get leaderboard
+app.get('/api/leaderboard', (req, res) => {
+    const allProfiles = Array.from(profiles.values())
+        .map(p => ({
+            ...p,
+            username: getUsername(p.wallet),
+            winRate: p.wins + p.losses > 0 ? ((p.wins / (p.wins + p.losses)) * 100).toFixed(1) : 0
+        }))
+        .sort((a, b) => b.wins - a.wins)
+        .slice(0, 20);
+    
+    res.json({ success: true, leaderboard: allProfiles });
+});
+
+// Get recent matches globally
+app.get('/api/matches', (req, res) => {
+    res.json({ success: true, matches: matchHistory.slice(0, 20) });
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -429,12 +544,19 @@ app.post('/api/rooms/:code/move', (req, res) => {
 // PAYOUT - Send tokens to winner
 // ═══════════════════════════════════════════════════════════════
 async function handlePayout(room) {
+    const winner = room.players[room.winner];
+    const loser = room.players.find(p => p.id !== room.winner);
+    
+    // Record match in history
+    if (winner?.wallet && loser?.wallet) {
+        recordMatch(room, winner.wallet, loser.wallet);
+    }
+    
     if (!wallet) {
         console.log('No wallet configured for payout');
         return;
     }
     
-    const winner = room.players[room.winner];
     if (!winner?.wallet) return;
     
     // Winner gets: (tokenAmount * 2) - 10% commission
