@@ -1,14 +1,67 @@
 /**
- * Chess Arena v5 - Custom Token Support ($TEST)
+ * Chess Arena v6 - With Persistence
  * - Token based payments (same token amount for both players)
  * - Price fetched from Jupiter/DexScreener at room creation
  * - Security hardened
+ * - JSON file persistence for data
  */
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const { Connection, PublicKey, Keypair, Transaction } = require('@solana/web3.js');
 const { getAssociatedTokenAddress, createTransferInstruction, TOKEN_2022_PROGRAM_ID } = require('@solana/spl-token');
 const bs58 = require('bs58');
+
+// ═══════════════════════════════════════════════════════════════
+// PERSISTENCE - Save/Load data to JSON files
+// ═══════════════════════════════════════════════════════════════
+const DATA_DIR = process.env.DATA_DIR || './data';
+const DATA_FILE = path.join(DATA_DIR, 'chess_data.json');
+
+// Ensure data directory exists
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function loadData() {
+    try {
+        if (fs.existsSync(DATA_FILE)) {
+            const raw = fs.readFileSync(DATA_FILE, 'utf8');
+            const data = JSON.parse(raw);
+            console.log('✅ Data loaded from file');
+            return data;
+        }
+    } catch (e) {
+        console.error('Error loading data:', e.message);
+    }
+    return null;
+}
+
+function saveData() {
+    try {
+        const data = {
+            usernames: Object.fromEntries(usernames),
+            profiles: Object.fromEntries(profiles),
+            matchHistory: matchHistory.slice(0, 500), // Keep last 500 matches
+            xLinkedAccounts: Object.fromEntries(xLinkedAccounts),
+            followers: Object.fromEntries(Array.from(followers.entries()).map(([k, v]) => [k, Array.from(v)])),
+            following: Object.fromEntries(Array.from(following.entries()).map(([k, v]) => [k, Array.from(v)])),
+            savedAt: Date.now()
+        };
+        fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+        console.log('💾 Data saved to file');
+    } catch (e) {
+        console.error('Error saving data:', e.message);
+    }
+}
+
+// Auto-save every 2 minutes
+setInterval(saveData, 2 * 60 * 1000);
+
+// Save on exit
+process.on('SIGTERM', () => { saveData(); process.exit(0); });
+process.on('SIGINT', () => { saveData(); process.exit(0); });
 
 const app = express();
 
@@ -130,13 +183,19 @@ if (WALLET_PRIVATE_KEY) {
 
 const rooms = new Map();
 const processedTx = new Set();
-const usernames = new Map();
-const profiles = new Map(); // wallet -> profile data
-const matchHistory = []; // All completed matches
 const xVerifications = new Map(); // wallet -> { code, createdAt, xHandle }
-const xLinkedAccounts = new Map(); // wallet -> xHandle (verified)
-const followers = new Map(); // wallet -> Set of follower wallets
-const following = new Map(); // wallet -> Set of following wallets
+
+// Load saved data or create empty structures
+const savedData = loadData();
+const usernames = new Map(savedData?.usernames ? Object.entries(savedData.usernames) : []);
+const profiles = new Map(savedData?.profiles ? Object.entries(savedData.profiles) : []);
+const matchHistory = savedData?.matchHistory || [];
+const xLinkedAccounts = new Map(savedData?.xLinkedAccounts ? Object.entries(savedData.xLinkedAccounts) : []);
+const followers = new Map(savedData?.followers ? Object.entries(savedData.followers).map(([k, v]) => [k, new Set(v)]) : []);
+const following = new Map(savedData?.following ? Object.entries(savedData.following).map(([k, v]) => [k, new Set(v)]) : []);
+
+console.log(`📊 Loaded: ${usernames.size} users, ${profiles.size} profiles, ${matchHistory.length} matches`);
+
 let cachedTokenPrice = null;
 let priceLastFetch = 0;
 
@@ -227,6 +286,7 @@ app.post('/api/username', (req, res) => {
     
     usernames.set(wallet, cleanUsername);
     console.log('Username set:', wallet.slice(0,8), '->', cleanUsername);
+    saveData(); // Persist
     res.json({ success: true, username: cleanUsername });
 });
 
@@ -305,6 +365,7 @@ function recordMatch(room, winnerWallet, loserWallet) {
     if (matchHistory.length > 200) matchHistory.pop();
     
     console.log(`Match recorded: ${match.winner.name} beat ${match.loser.name}`);
+    saveData(); // Persist after match
     return match;
 }
 
@@ -365,6 +426,7 @@ app.post('/api/profile/avatar', (req, res) => {
     profile.avatar = cleanAvatar;
     
     console.log('Avatar updated:', wallet.slice(0, 8), '->', cleanAvatar);
+    saveData(); // Persist
     res.json({ success: true, avatar: cleanAvatar });
 });
 
@@ -392,6 +454,7 @@ app.post('/api/follow', (req, res) => {
     followers.get(targetWallet).add(wallet);
     
     console.log('Follow:', wallet.slice(0, 8), '->', targetWallet.slice(0, 8));
+    saveData(); // Persist
     res.json({ 
         success: true, 
         followersCount: getFollowerCount(targetWallet),
@@ -413,6 +476,7 @@ app.post('/api/unfollow', (req, res) => {
     followers.get(targetWallet)?.delete(wallet);
     
     console.log('Unfollow:', wallet.slice(0, 8), '-X->', targetWallet.slice(0, 8));
+    saveData(); // Persist
     res.json({ 
         success: true, 
         followersCount: getFollowerCount(targetWallet),
@@ -598,6 +662,7 @@ app.post('/api/x/verify', async (req, res) => {
             profile.xHandle = cleanHandle;
             
             console.log('X account linked:', wallet.slice(0, 8), '->', '@' + cleanHandle);
+            saveData(); // Persist
             
             res.json({
                 success: true,
@@ -630,6 +695,7 @@ app.post('/api/x/unlink', (req, res) => {
         if (profile) delete profile.xHandle;
         
         console.log('X account unlinked:', wallet.slice(0, 8), '@' + oldHandle);
+        saveData(); // Persist
         res.json({ success: true, message: 'X hesabı bağlantısı kaldırıldı' });
     } else {
         res.json({ success: true, message: 'No X account linked' });
